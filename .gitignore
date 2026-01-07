@@ -1,0 +1,12 @@
+# Binaries
+dashboard
+spammer
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
