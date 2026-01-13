@@ -94,6 +94,18 @@ var (
 		Value:   "cross-unsafe",
 		EnvVars: []string{"SAFETY_LEVEL"},
 	}
+	InvalidPercentFlag = &cli.Float64Flag{
+		Name:    "invalid-percent",
+		Usage:   "Target percentage of invalid queries (0-100), actual rate varies with noise",
+		Value:   50.0,
+		EnvVars: []string{"INVALID_PERCENT"},
+	}
+	NoiseRangeFlag = &cli.Float64Flag{
+		Name:    "noise-range",
+		Usage:   "Random noise range (+/-) applied to invalid-percent for unpredictability",
+		Value:   10.0,
+		EnvVars: []string{"NOISE_RANGE"},
+	}
 	JWTSecretFlag = &cli.StringFlag{
 		Name:    "jwt-secret",
 		Usage:   "Path to JWT secret for authenticated admin RPC endpoints (optional)",
@@ -213,6 +225,8 @@ func main() {
 		MetricsPortFlag,
 		MetricsEnabledFlag,
 		SafetyLevelFlag,
+		InvalidPercentFlag,
+		NoiseRangeFlag,
 		JWTSecretFlag,
 	}, oplog.CLIFlags("SPAMMER")...))
 	app.Action = run
@@ -250,6 +264,15 @@ func run(cliCtx *cli.Context) error {
 		safetyLevel = suptypes.CrossUnsafe
 	default:
 		return fmt.Errorf("invalid safety-level %q: must be 'unsafe' or 'cross-unsafe'", safetyLevelStr)
+	}
+
+	invalidPercent := cliCtx.Float64(InvalidPercentFlag.Name)
+	noiseRange := cliCtx.Float64(NoiseRangeFlag.Name)
+	if invalidPercent < 0 || invalidPercent > 100 {
+		return fmt.Errorf("invalid-percent must be between 0 and 100, got %f", invalidPercent)
+	}
+	if noiseRange < 0 {
+		return fmt.Errorf("noise-range must be non-negative, got %f", noiseRange)
 	}
 
 	ctx := cliCtx.Context
@@ -292,6 +315,8 @@ func run(cliCtx *cli.Context) error {
 		"blockRange", blockRange,
 		"queryInterval", queryInterval,
 		"safetyLevel", safetyLevel,
+		"invalidPercent", invalidPercent,
+		"noiseRange", noiseRange,
 		"metricsEnabled", metricsEnabled,
 		"metricsPort", metricsPort,
 	)
@@ -436,8 +461,25 @@ func run(cliCtx *cli.Context) error {
 			logger.Info("Shutting down", "validQueries", validQueries, "invalidQueries", invalidQueries, "errors", errorCount)
 			return nil
 		case <-ticker.C:
-			// Alternate between valid and invalid queries
-			if i%2 == 0 {
+			// Decide query type using percentage-based targeting with noise
+			// Apply random noise to the target percentage for unpredictability
+			effectiveInvalidPercent := invalidPercent
+			if noiseRange > 0 {
+				// Add noise: random value in range [-noiseRange, +noiseRange]
+				noise := (rand.Float64()*2 - 1) * noiseRange
+				effectiveInvalidPercent = invalidPercent + noise
+				// Clamp to valid range
+				if effectiveInvalidPercent < 0 {
+					effectiveInvalidPercent = 0
+				} else if effectiveInvalidPercent > 100 {
+					effectiveInvalidPercent = 100
+				}
+			}
+
+			// Randomly decide if this query should be invalid based on effective percentage
+			sendInvalid := rand.Float64()*100 < effectiveInvalidPercent
+
+			if !sendInvalid {
 				if err := spammer.RunValidQuery(ctx); err != nil {
 					logger.Error("Valid query failed unexpectedly", "err", err, "query", i)
 					errorCount++

@@ -6,9 +6,11 @@ Testing utilities for the op-interop-filter service.
 
 ### Spammer
 
-Query generator that tests the filter by sending valid and invalid queries. It fetches real logs from the blockchain, then alternates between:
+Query generator that tests the filter by sending valid and invalid queries. It fetches real logs from the blockchain, then sends a configurable percentage of:
 - **Valid queries**: Real logs with correct checksums (should be accepted)
 - **Invalid queries**: Real logs with corrupted checksums (should be rejected)
+
+The invalid percentage is configurable with optional noise to create more realistic patterns.
 
 ```bash
 go run ./cmd/spammer --help
@@ -75,6 +77,8 @@ go run ./cmd/spammer \
   --query-interval 1s \
   --safety-level cross-unsafe \
   --block-range 50 \
+  --invalid-percent 30 \
+  --noise-range 15 \
   --metrics.port 7301
 ```
 
@@ -83,6 +87,8 @@ go run ./cmd/spammer \
 - `--safety-level`: Use `cross-unsafe` to test cross-chain validation, or `unsafe` for local-only
 - `--block-range`: How many recent blocks to sample from (smaller = more recent = less likely to hit timing issues)
 - `--num-queries 0`: Run indefinitely (or set a number to stop after N queries)
+- `--invalid-percent`: Target percentage of invalid queries (default: 50)
+- `--noise-range`: Random variation around the target percentage (default: 10). E.g., `--invalid-percent 30 --noise-range 15` produces 15-45% invalid queries
 
 ### Step 4: Run the Dashboard (Optional)
 
@@ -101,12 +107,14 @@ go run ./cmd/dashboard \
 
 The spammer logs should show progress like:
 ```
-lvl=info msg=Progress queries=100 valid=50 invalid=50 errors=0
+lvl=info msg=Progress queries=100 valid=62 invalid=38 errors=0
 ```
 
 - **valid**: Number of valid queries (should all be accepted)
-- **invalid**: Number of invalid queries (should all be rejected)
+- **invalid**: Number of invalid queries (should all be rejected with "payload hash mismatch")
 - **errors**: Unexpected errors (should be 0)
+
+The ratio of valid/invalid depends on `--invalid-percent` and `--noise-range` flags.
 
 **Success criteria:**
 - Valid queries: ~100% accepted
