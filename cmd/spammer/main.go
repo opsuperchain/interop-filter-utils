@@ -111,6 +111,23 @@ var (
 		Usage:   "Path to JWT secret for authenticated admin RPC endpoints (optional)",
 		EnvVars: []string{"JWT_SECRET"},
 	}
+	CaptureFlag = &cli.BoolFlag{
+		Name:    "capture",
+		Usage:   "Capture mode: fetch blocks and save to JSON file instead of spamming",
+		EnvVars: []string{"CAPTURE"},
+	}
+	CaptureOutputFlag = &cli.StringFlag{
+		Name:    "capture-output",
+		Usage:   "Output file path for captured blocks (default: captured_blocks.json)",
+		Value:   "captured_blocks.json",
+		EnvVars: []string{"CAPTURE_OUTPUT"},
+	}
+	CaptureCountFlag = &cli.IntFlag{
+		Name:    "capture-count",
+		Usage:   "Number of blocks to capture (captures blocks with logs)",
+		Value:   20,
+		EnvVars: []string{"CAPTURE_COUNT"},
+	}
 )
 
 // Metrics for the spammer
@@ -167,6 +184,35 @@ func (r *RecentQueries) Get() []RecentQuery {
 		result[len(r.queries)-1-i] = q
 	}
 	return result
+}
+
+// CapturedBlock holds a block's info and receipts for test fixtures
+type CapturedBlock struct {
+	Number    uint64                `json:"number"`
+	Hash      common.Hash           `json:"hash"`
+	ParentHash common.Hash          `json:"parent_hash"`
+	Timestamp uint64                `json:"timestamp"`
+	Receipts  []*CapturedReceipt    `json:"receipts"`
+}
+
+// CapturedReceipt holds receipt data with logs
+type CapturedReceipt struct {
+	TxHash common.Hash     `json:"tx_hash"`
+	Logs   []*CapturedLog  `json:"logs"`
+}
+
+// CapturedLog holds log data needed for testing
+type CapturedLog struct {
+	Address common.Address `json:"address"`
+	Topics  []common.Hash  `json:"topics"`
+	Data    []byte         `json:"data"`
+	Index   uint           `json:"index"`
+}
+
+// CapturedData is the top-level structure for captured test data
+type CapturedData struct {
+	ChainID uint64           `json:"chain_id"`
+	Blocks  []*CapturedBlock `json:"blocks"`
 }
 
 func newSpammerMetrics(reg prometheus.Registerer) *SpammerMetrics {
@@ -228,6 +274,9 @@ func main() {
 		InvalidPercentFlag,
 		NoiseRangeFlag,
 		JWTSecretFlag,
+		CaptureFlag,
+		CaptureOutputFlag,
+		CaptureCountFlag,
 	}, oplog.CLIFlags("SPAMMER")...))
 	app.Action = run
 
@@ -344,6 +393,13 @@ func run(cliCtx *cli.Context) error {
 		return fmt.Errorf("failed to create eth client: %w", err)
 	}
 	defer ethClient.Close()
+
+	// Check for capture mode
+	if cliCtx.Bool(CaptureFlag.Name) {
+		captureOutput := cliCtx.String(CaptureOutputFlag.Name)
+		captureCount := cliCtx.Int(CaptureCountFlag.Name)
+		return runCaptureMode(ctx, logger, ethClient, chainID, blockRange, captureCount, captureOutput)
+	}
 
 	// Connect to filter RPC (public supervisor API)
 	filterClient, err := rpc.DialContext(ctx, filterRPC)
@@ -785,4 +841,139 @@ func LogToLogHash(l *gethtypes.Log) common.Hash {
 
 	// Compute log hash
 	return suptypes.PayloadHashToLogHash(payloadHash, l.Address)
+}
+
+// runCaptureMode captures blocks with receipts to a JSON file for test fixtures
+func runCaptureMode(
+	ctx context.Context,
+	logger log.Logger,
+	ethClient *sources.EthClient,
+	chainID uint64,
+	blockRange int,
+	captureCount int,
+	outputPath string,
+) error {
+	logger.Info("Running in capture mode",
+		"chainID", chainID,
+		"blockRange", blockRange,
+		"captureCount", captureCount,
+		"output", outputPath,
+	)
+
+	// Get current head
+	head, err := ethClient.InfoByLabel(ctx, eth.Unsafe)
+	if err != nil {
+		return fmt.Errorf("failed to get head: %w", err)
+	}
+	headNum := head.NumberU64()
+	logger.Info("Current L2 head", "block", headNum)
+
+	// Calculate block range to sample from
+	var startBlock uint64
+	if headNum > uint64(blockRange) {
+		startBlock = headNum - uint64(blockRange)
+	} else {
+		startBlock = 1
+	}
+
+	captured := &CapturedData{
+		ChainID: chainID,
+		Blocks:  make([]*CapturedBlock, 0, captureCount),
+	}
+
+	// Scan blocks looking for ones with logs
+	blocksWithLogs := 0
+	for blockNum := startBlock; blockNum <= headNum && blocksWithLogs < captureCount; blockNum++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Get block info
+		block, err := ethClient.InfoByNumber(ctx, blockNum)
+		if err != nil {
+			logger.Warn("Failed to get block, skipping", "block", blockNum, "err", err)
+			continue
+		}
+
+		// Get receipts
+		_, receipts, err := ethClient.FetchReceipts(ctx, block.Hash())
+		if err != nil {
+			logger.Warn("Failed to get receipts, skipping", "block", blockNum, "err", err)
+			continue
+		}
+
+		// Check if block has logs
+		hasLogs := false
+		for _, receipt := range receipts {
+			if len(receipt.Logs) > 0 {
+				hasLogs = true
+				break
+			}
+		}
+
+		if !hasLogs {
+			continue
+		}
+
+		// Capture this block
+		capturedBlock := &CapturedBlock{
+			Number:     block.NumberU64(),
+			Hash:       block.Hash(),
+			ParentHash: block.ParentHash(),
+			Timestamp:  block.Time(),
+			Receipts:   make([]*CapturedReceipt, 0),
+		}
+
+		for _, receipt := range receipts {
+			if len(receipt.Logs) == 0 {
+				continue
+			}
+
+			capturedReceipt := &CapturedReceipt{
+				TxHash: receipt.TxHash,
+				Logs:   make([]*CapturedLog, len(receipt.Logs)),
+			}
+
+			for i, l := range receipt.Logs {
+				capturedReceipt.Logs[i] = &CapturedLog{
+					Address: l.Address,
+					Topics:  l.Topics,
+					Data:    l.Data,
+					Index:   l.Index,
+				}
+			}
+
+			capturedBlock.Receipts = append(capturedBlock.Receipts, capturedReceipt)
+		}
+
+		captured.Blocks = append(captured.Blocks, capturedBlock)
+		blocksWithLogs++
+		logger.Info("Captured block", "block", blockNum, "receipts", len(capturedBlock.Receipts), "progress", fmt.Sprintf("%d/%d", blocksWithLogs, captureCount))
+	}
+
+	if len(captured.Blocks) == 0 {
+		return fmt.Errorf("no blocks with logs found in range %d-%d", startBlock, headNum)
+	}
+
+	// Write to file
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(captured); err != nil {
+		return fmt.Errorf("failed to write JSON: %w", err)
+	}
+
+	logger.Info("Capture complete",
+		"blocks", len(captured.Blocks),
+		"output", outputPath,
+	)
+
+	return nil
 }
